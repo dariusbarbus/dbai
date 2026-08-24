@@ -6,6 +6,9 @@ import glob
 import readline
 import re
 import subprocess
+from html.parser import HTMLParser
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from openai import OpenAI
 
@@ -29,6 +32,7 @@ COMMANDS = [
     "/read",
     "/read-ls",
     "/write",
+    "/web",
     "/run",
     "/tokens",
     "/clear",
@@ -36,11 +40,377 @@ COMMANDS = [
 ]
 
 
+class HTMLTextExtractor(HTMLParser):
+    # Convert HTML into readable text for the model.
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self.skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"script", "style", "noscript"}:
+            self.skip_depth += 1
+            return
+
+        if self.skip_depth == 0 and tag in {
+            "p", "div", "section", "article", "br",
+            "li", "ul", "ol", "h1", "h2", "h3",
+            "h4", "h5", "h6", "title",
+        }:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in {"script", "style", "noscript"} and self.skip_depth > 0:
+            self.skip_depth -= 1
+            return
+
+        if self.skip_depth == 0 and tag in {
+            "p", "div", "section", "article", "li",
+            "ul", "ol", "h1", "h2", "h3", "h4",
+            "h5", "h6", "title",
+        }:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if self.skip_depth == 0:
+            self.parts.append(data)
+
+    def get_text(self):
+        text = "".join(self.parts)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = re.sub(r"[ \t]+", " ", text)
+        return text.strip()
+
+
 def get_models():
     # Lists the client's available models.
     models = client.models.list()
 
     return [m.id for m in models.data]
+
+
+def stream_chat_completion(model, messages, show_output=True):
+    # Send the conversation to LM Studio and optionally stream it
+    # to the terminal.
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.2,
+        stream=True,
+        stream_options={
+            "include_usage": True
+        },
+    )
+
+    answer = ""
+    prompt_tokens = None
+    completion_tokens = None
+    total_tokens = None
+
+    if show_output:
+        print()
+
+    for chunk in response:
+        if chunk.usage is not None:
+            prompt_tokens = chunk.usage.prompt_tokens
+            completion_tokens = chunk.usage.completion_tokens
+            total_tokens = chunk.usage.total_tokens
+
+        if not chunk.choices:
+            continue
+
+        text = chunk.choices[0].delta.content
+
+        if text:
+            if show_output:
+                print(
+                    text,
+                    end="",
+                    flush=True
+                )
+
+            answer += text
+
+    if show_output:
+        print()
+
+    return (
+        answer,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+    )
+
+
+def normalize_web_text(content_type, raw_bytes):
+    # Convert downloaded data into plain text that is useful to the AI.
+    content_type = (content_type or "").lower()
+    content = raw_bytes.decode("utf-8", errors="replace")
+
+    if "html" in content_type:
+        parser = HTMLTextExtractor()
+        parser.feed(content)
+        text = parser.get_text()
+
+    else:
+        text = content
+
+    text = text.strip()
+
+    if len(text) > 12000:
+        text = text[:12000] + "\n\n[content truncated]"
+
+    return text
+
+
+def is_allowed_web_url(url):
+    # Allow only normal public HTTP/HTTPS URLs.
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+
+    if parsed.scheme not in {"http", "https"}:
+        return False
+
+    if not parsed.netloc:
+        return False
+
+    host = (parsed.hostname or "").lower()
+
+    blocked_hosts = {
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+        "::1",
+    }
+
+    if host in blocked_hosts:
+        return False
+
+    if host.endswith(".local"):
+        return False
+
+    if re.fullmatch(r"10\.\d+\.\d+\.\d+", host):
+        return False
+
+    if re.fullmatch(r"192\.168\.\d+\.\d+", host):
+        return False
+
+    if re.fullmatch(r"172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+", host):
+        return False
+
+    return True
+
+
+def fetch_web_url(url):
+    # Download a web page using GET only.
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "dbai/1.0",
+            "Accept": (
+                "text/html,application/json,text/plain,"
+                "application/xhtml+xml,*/*;q=0.8"
+            ),
+        },
+        method="GET",
+    )
+
+    with urlopen(request, timeout=15) as response:
+        status = getattr(response, "status", None)
+        final_url = response.geturl()
+        content_type = response.headers.get("Content-Type", "")
+        raw_bytes = response.read(200000)
+
+    if not is_allowed_web_url(final_url):
+        raise ValueError(
+            "redirected to a blocked or non-public URL"
+        )
+
+    text = normalize_web_text(content_type, raw_bytes)
+
+    return status, content_type, text
+
+
+def run_web_requests(answer):
+    # Find web requests explicitly requested by the AI.
+    pattern = r"<get_url>\s*(.*?)\s*</get_url>"
+
+    matches = re.findall(
+        pattern,
+        answer,
+        re.DOTALL,
+    )
+
+    if not matches:
+        return None
+
+    web_results = []
+
+    for url in matches[:3]:
+        url = url.strip()
+
+        if not url:
+            continue
+
+        print()
+        print("=" * 60)
+        print("WEB REQUEST")
+        print("=" * 60)
+        print(url)
+        print("=" * 60)
+        print()
+
+        if not is_allowed_web_url(url):
+            print("Web request rejected: only public http/https URLs are allowed.")
+            web_results.append(
+                f"Web request rejected:\n{url}\n\n"
+                "Reason: only public http/https URLs are allowed."
+            )
+            continue
+
+        approval = input(
+            "Fetch this URL with HTTP GET? Type 'yes' to approve: "
+        ).strip().lower()
+
+        if approval != "yes":
+            print("Web request NOT executed.")
+            web_results.append(
+                f"Web request was rejected by the user:\n{url}"
+            )
+            continue
+
+        print("\nFetching URL with GET...\n")
+
+        try:
+            status, content_type, text = fetch_web_url(url)
+
+            print(f"HTTP status: {status}")
+            print(f"Content-Type: {content_type}")
+
+            web_results.append(
+                f"URL fetched with GET:\n"
+                f"{url}\n\n"
+                f"HTTP status: {status}\n"
+                f"Content-Type: {content_type}\n\n"
+                f"Retrieved content:\n{text}"
+            )
+
+        except Exception as e:
+            print(f"Could not fetch URL: {e}")
+            web_results.append(
+                f"URL could not be fetched:\n"
+                f"{url}\n\n"
+                f"Error: {e}"
+            )
+
+    if web_results:
+        return "\n\n".join(web_results)
+
+    return None
+
+
+def handle_web_request(model, messages, request):
+    # Let the AI request URLs in a few short GET-only rounds.
+    original_length = len(messages)
+    web_messages = list(messages)
+
+    web_messages.append({
+        "role": "user",
+        "content": (
+            "The user wants you to access the web using GET only.\n\n"
+            f"User request:\n{request}\n\n"
+            "If you need a web page, output ONLY one or more URLs in "
+            "this exact format:\n\n"
+            "<get_url>\n"
+            "https://example.com\n"
+            "</get_url>\n\n"
+            "Rules:\n"
+            "- Use only public http or https URLs.\n"
+            "- Do not use markdown code fences.\n"
+            "- Do not claim that you fetched anything yourself.\n"
+            "- You may request up to 3 URLs at a time.\n"
+            "- If you already have enough information, answer normally "
+            "instead of outputting <get_url> blocks.\n"
+            "- Search engine result pages are allowed if needed.\n"
+            "- If you need search, a GET URL such as "
+            "https://html.duckduckgo.com/html/?q=YOUR+QUERY is allowed."
+        ),
+    })
+
+    final_answer = None
+    prompt_tokens = None
+    completion_tokens = None
+    total_tokens = None
+
+    for round_number in range(3):
+        answer, prompt_tokens, completion_tokens, total_tokens = (
+            stream_chat_completion(
+                model,
+                web_messages,
+                show_output=False,
+            )
+        )
+
+        web_messages.append({
+            "role": "assistant",
+            "content": answer,
+        })
+
+        web_result = run_web_requests(answer)
+
+        if not web_result:
+            final_answer = answer
+            break
+
+        if round_number == 2:
+            web_messages.append({
+                "role": "user",
+                "content": (
+                    f"{web_result}\n\n"
+                    "This was the last allowed web retrieval round. "
+                    "Answer the user's request now without requesting "
+                    "another URL."
+                ),
+            })
+            break
+
+        web_messages.append({
+            "role": "user",
+            "content": (
+                f"{web_result}\n\n"
+                "Use the retrieved content above. "
+                "If you still need more web information, you may request "
+                "more URLs with <get_url>. Otherwise answer normally."
+            ),
+        })
+
+    if final_answer is None:
+        final_answer, prompt_tokens, completion_tokens, total_tokens = (
+            stream_chat_completion(
+                model,
+                web_messages,
+                show_output=True,
+            )
+        )
+
+        web_messages.append({
+            "role": "assistant",
+            "content": final_answer,
+        })
+
+    else:
+        print()
+        print(final_answer)
+
+    return (
+        web_messages[original_length:],
+        final_answer,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+    )
 
 
 def read_files(pattern):
@@ -523,9 +893,19 @@ def main():
                 "Never put executable commands outside a "
                 "<run_command> block. "
 
+                "When the user uses /web, you may request public web "
+                "pages using ONLY the required <get_url> format. "
+
+                "Never put URLs to fetch outside a <get_url> block "
+                "during /web tool use. "
+
+                "Use only public http or https URLs for /web. "
+
+                "Never assume a URL has been approved or fetched. "
+
                 "Never assume a command has been approved. "
                 "The terminal program will ask the user for approval "
-                "before executing every command."
+                "before executing every command or web request."
             ),
         }
     ]
@@ -568,6 +948,7 @@ def main():
             print("  /read FILE   Add a file to context")
             print("  /read-ls     List files currently added to context")
             print("  /write DESC  Create or modify a file using AI")
+            print("  /web DESC    Let AI retrieve web pages with GET only")
             print("  /run DESC    Generate and run a command using AI")
             print("  /tokens      Show token count")
             print("  /clear       Clear conversation")
@@ -805,6 +1186,14 @@ def main():
                 ),
             })
 
+        elif user_input.startswith("/web "):
+
+            request = user_input[5:].strip()
+
+            if not request:
+                print("Usage: /web DESCRIPTION_OR_URL")
+                continue
+
         else:
 
             # Anything that isn't a recognized command is treated as
@@ -815,6 +1204,21 @@ def main():
             })
 
         try:
+            if user_input.startswith("/web "):
+                (
+                    new_messages,
+                    answer,
+                    last_prompt_tokens,
+                    last_completion_tokens,
+                    last_total_tokens,
+                ) = handle_web_request(
+                    model,
+                    messages,
+                    request,
+                )
+
+                messages.extend(new_messages)
+                continue
 
             # Send the entire conversation history to LM Studio.
             #
@@ -823,64 +1227,16 @@ def main():
             #
             # include_usage=True asks LM Studio to include actual token
             # usage information in the streaming response.
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0.2,
-                stream=True,
-                stream_options={
-                    "include_usage": True
-                },
+            (
+                answer,
+                last_prompt_tokens,
+                last_completion_tokens,
+                last_total_tokens,
+            ) = stream_chat_completion(
+                model,
+                messages,
+                show_output=True,
             )
-
-            # Store the complete response so it can be added to the
-            # conversation history after streaming finishes.
-            answer = ""
-
-            # Create an empty line between the user's prompt and AI response.
-            print()
-
-            # Process each piece of the streaming response.
-            for chunk in response:
-
-                # LM Studio provides usage information in a final
-                # streaming chunk.
-                if chunk.usage is not None:
-
-                    # Save the actual token counts reported by LM Studio.
-                    last_prompt_tokens = (
-                        chunk.usage.prompt_tokens
-                    )
-
-                    last_completion_tokens = (
-                        chunk.usage.completion_tokens
-                    )
-
-                    last_total_tokens = (
-                        chunk.usage.total_tokens
-                    )
-
-                # Some streaming chunks contain usage information only
-                # and therefore don't contain any choices.
-                if not chunk.choices:
-                    continue
-
-                # Get the newly generated text from this chunk.
-                text = chunk.choices[0].delta.content
-
-                # Print the text immediately and save it for the
-                # conversation history.
-                if text:
-                    print(
-                        text,
-                        end="",
-                        flush=True
-                    )
-
-                    answer += text
-
-            # Move to a new line after the streamed response.
-            print()
 
             # If this was a /write request, process targeted edits
             # and new file creation requests.
