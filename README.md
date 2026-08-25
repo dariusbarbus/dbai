@@ -8,7 +8,8 @@ The agent provides an interactive terminal interface that provides support for:
 
 - Local LLM conversations.
 - Reading files directly from chat.
-- Creating and modifying files.
+- Creating and modifying files, with targeted edits to existing files.
+- Retrieving public web pages with *explicit user approval*.
 - Executing terminal commands with *explicit user approval*.
 - Conversation management.
 - Token usage report.
@@ -125,6 +126,38 @@ This approval step is intentional. **Never allow an AI to run arbitrary code wit
 
 ---
 
+### `/web`
+
+Ask the AI to retrieve public web pages to help answer your question.
+
+For example:
+
+```text
+/web what's the latest stable version of Rust?
+```
+
+The AI requests one or more URLs to fetch, and each request is displayed and requires explicit approval before anything is downloaded:
+
+```text
+<get_url>
+https://example.com
+</get_url>
+```
+
+The page will **not** be fetched unless the user enters `yes`.
+
+A few things worth knowing about how `/web` works:
+
+- **GET only.** dbai never sends any other HTTP method — it can only read pages, never submit forms or trigger actions.
+- **Public URLs only.** Requests to `localhost`, loopback addresses, and private/internal IP ranges (`10.x`, `172.16–31.x`, `192.168.x`, `.local` hosts) are rejected automatically, even if the AI requests them.
+- **HTML is converted to plain text** before being added to context, stripping scripts, styles, and markup so the model gets readable content instead of raw HTML.
+- **Content is capped** at roughly 12,000 characters per page to keep token usage predictable; anything beyond that is truncated.
+- **Up to 3 URLs per request, and up to 3 retrieval rounds** per `/web` command, so the AI can follow up with another page if the first one wasn't enough — without being able to crawl indefinitely.
+
+This approval step is intentional, for the same reason as `/run`: **never let an AI make network requests without user confirmation.**
+
+---
+
 ## Requirements
 
 ### Operating system
@@ -163,7 +196,7 @@ This is the local API configuration used by LM Studio and is not a secret API ke
 
 This software is provided AS-IS, without warranty of any kind.
 
-This agent provides the AI with read/write/execute control on your terminal, filesystem, and computer. Run it at your own risk and review every command before accepting it.
+This agent provides the AI with read/write/execute control on your terminal, filesystem, and computer, as well as the ability to request web page retrieval. Run it at your own risk and review every command or URL before accepting it.
 
 I'm not responsible for misuse of this tool.
 
