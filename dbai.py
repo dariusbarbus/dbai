@@ -3,6 +3,7 @@
 import os
 import sys
 import glob
+import json
 import readline
 import re
 import subprocess
@@ -83,10 +84,97 @@ class HTMLTextExtractor(HTMLParser):
 
 
 def get_models():
-    # Lists the client's available models.
-    models = client.models.list()
+    # Check whether LM Studio is running and return the available models.
+    #
+    # Returns:
+    #   (model_ids, has_loaded_model)
+    #
+    # model_ids contains the loaded model list when one is already loaded.
+    # If no model is loaded, it falls back to the LM Studio model catalog
+    # so the user can still select one.
+    try:
+        models = client.models.list()
 
-    return [m.id for m in models.data]
+    except Exception as e:
+        print("Could not connect to LM Studio.")
+        print(
+            "Make sure LM Studio is running and that its local "
+            f"server is enabled at {BASE_URL}."
+        )
+        print(f"Connection error: {e}")
+        sys.exit(1)
+
+    loaded_models = [m.id for m in models.data]
+
+    if loaded_models:
+        return loaded_models, True
+
+    available_models = get_lm_studio_available_models()
+
+    if available_models:
+        return available_models, False
+
+    print("LM Studio is running, but no models are available.")
+    print(
+        "Download or load a model in LM Studio, then try again."
+    )
+    sys.exit(1)
+
+
+def get_lm_studio_available_models():
+    # Ask LM Studio for the full model list so the user can choose
+    # a model even when nothing is currently loaded.
+    api_root = BASE_URL.rsplit("/v1", 1)[0]
+    models_url = f"{api_root}/api/v0/models"
+
+    request = Request(
+        models_url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "dbai/1.0",
+        },
+        method="GET",
+    )
+
+    try:
+        with urlopen(request, timeout=10) as response:
+            raw_body = response.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+
+    except Exception:
+        return []
+
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError:
+        return []
+
+    if isinstance(payload, dict):
+        model_items = payload.get("data") or payload.get("models") or []
+    elif isinstance(payload, list):
+        model_items = payload
+    else:
+        return []
+
+    model_ids = []
+
+    for item in model_items:
+        if not isinstance(item, dict):
+            continue
+
+        model_id = (
+            item.get("id")
+            or item.get("modelKey")
+            or item.get("path")
+            or item.get("name")
+        )
+
+        if model_id and model_id not in model_ids:
+            model_ids.append(model_id)
+
+    return model_ids
 
 
 def stream_chat_completion(model, messages, show_output=True):
@@ -817,12 +905,7 @@ def main():
     readline.parse_and_bind("tab: complete")
 
     # Get the models currently available from LM Studio.
-    models = get_models()
-
-    # Stop if LM Studio didn't return any models.
-    if not models:
-        print("No models available from LM Studio.")
-        sys.exit(1)
+    models, has_loaded_model = get_models()
 
     # Display the available models.
     print("Available models:")
@@ -841,6 +924,12 @@ def main():
         # Handle invalid model selections.
         print("Invalid selection.")
         sys.exit(1)
+
+    if not has_loaded_model:
+        print(
+            f"\nNo model is currently loaded in LM Studio. "
+            f"Loading {model} now..."
+        )
 
     # Show the selected model.
     print(f"\nUsing: {model}")
