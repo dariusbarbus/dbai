@@ -501,7 +501,7 @@ def handle_web_request(model, messages, request):
     )
 
 
-def read_files(pattern):
+def read_files(pattern, already_added=None):
     # If "." is used, read all files in the current directory.
     if pattern == ".":
         files = [
@@ -514,10 +514,25 @@ def read_files(pattern):
         # This can be a filename, wildcard, or recursive glob.
         files = glob.glob(pattern, recursive=True)
 
+    def normalize_context_path(path):
+        # Resolve relative paths and symlinks so the same file
+        # cannot be added twice through different path spellings.
+        return os.path.realpath(path)
+
+    # Track files that are already in the conversation so they are
+    # not added twice and do not consume tokens again.
+    if already_added is None:
+        already_added = set()
+    else:
+        already_added = {
+            normalize_context_path(path)
+            for path in already_added
+        }
+
     # Stop if the pattern didn't match anything.
     if not files:
         print(f"No files found: {pattern}")
-        return "", []
+        return "", [], []
 
     # This will hold the contents of all matching files.
     result = []
@@ -525,11 +540,20 @@ def read_files(pattern):
     # This will hold the filenames successfully added to the conversation.
     added_files = []
 
+    # This will hold files skipped because they were already loaded.
+    skipped_files = []
+
     # Process every matching path.
     for path in files:
 
         # Ignore directories; only read actual files.
         if not os.path.isfile(path):
+            continue
+
+        normalized_path = normalize_context_path(path)
+
+        if normalized_path in already_added:
+            skipped_files.append(path)
             continue
 
         try:
@@ -548,13 +572,14 @@ def read_files(pattern):
 
             # Remember this file so /read-ls can display it later.
             added_files.append(path)
+            already_added.add(normalized_path)
 
         except Exception as e:
             # If a file can't be read, report the error and continue.
             print(f"Could not read {path}: {e}")
 
     # Combine all file contents into one string.
-    return "\n".join(result), added_files
+    return "\n".join(result), added_files, skipped_files
 
 
 def get_file_content(path):
@@ -1124,7 +1149,10 @@ def main():
             pattern = user_input[6:].strip()
 
             # Read the matching files.
-            content, added_files = read_files(pattern)
+            content, added_files, skipped_files = read_files(
+                pattern,
+                already_added=read_files_list,
+            )
 
             # Only add files to the conversation if content was found.
             if content:
@@ -1144,6 +1172,12 @@ def main():
                 print(
                     f"Added files matching: {pattern}"
                 )
+
+            if skipped_files:
+                print("Already in context, skipped:")
+
+                for path in skipped_files:
+                    print(f"  {path}")
 
             continue
 
