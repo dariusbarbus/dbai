@@ -6,6 +6,7 @@ import glob
 import json
 import readline
 import re
+import signal
 import subprocess
 from html.parser import HTMLParser
 from urllib.parse import urlparse
@@ -859,35 +860,55 @@ def run_ai_command(answer):
         print("\nExecuting command...\n")
 
         try:
-            # Execute the command through the user's shell.
-            # The command has already been explicitly approved by the user.
-            result = subprocess.run(
+            # Stream command output live so long-running commands do not
+            # look frozen while dbai waits for them to finish.
+            process = subprocess.Popen(
                 command,
                 shell=True,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
+                bufsize=1,
+                start_new_session=True,
             )
 
-            # Display stdout.
-            if result.stdout:
-                print(result.stdout, end="")
+            combined_output = []
 
-            # Display stderr.
-            if result.stderr:
-                print(result.stderr, end="")
+            if process.stdout is not None:
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                    combined_output.append(line)
+
+            return_code = process.wait()
 
             print()
-            print(f"Command exited with code: {result.returncode}")
+            print(f"Command exited with code: {return_code}")
 
             # Save the result so the AI can see what happened.
             command_results.append(
                 f"Command executed:\n"
                 f"{command}\n\n"
-                f"Exit code: {result.returncode}\n\n"
-                f"STDOUT:\n"
-                f"{result.stdout}\n\n"
-                f"STDERR:\n"
-                f"{result.stderr}"
+                f"Exit code: {return_code}\n\n"
+                f"Output:\n"
+                f"{''.join(combined_output)}"
+            )
+
+        except KeyboardInterrupt:
+            print("\nStopping command...\n")
+
+            try:
+                os.killpg(process.pid, signal.SIGINT)
+            except Exception:
+                process.terminate()
+
+            return_code = process.wait()
+
+            print(f"Command interrupted. Exit code: {return_code}")
+
+            command_results.append(
+                f"Command was interrupted by the user:\n"
+                f"{command}\n\n"
+                f"Exit code: {return_code}"
             )
 
         except Exception as e:
