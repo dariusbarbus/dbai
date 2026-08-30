@@ -7,6 +7,7 @@ Designed to run on locally hosted LLMs through the [LM Studio](https://lmstudio.
 The agent provides an interactive terminal interface that provides support for:
 
 - Local LLM conversations.
+- Switching models mid-session without restarting.
 - Reading files directly from chat.
 - Creating and modifying files, with targeted edits to existing files.
 - Retrieving public web pages with *explicit user approval*.
@@ -36,6 +37,28 @@ dbai
 ```
 
 And select your desired model.
+
+---
+
+### `/model`
+
+Switch to a different model without restarting dbai.
+
+```text
+/model
+```
+
+Lists every model in your LM Studio catalog and lets you pick by number. You can also select to a model by name:
+
+```text
+/model qwen2.5-coder-7b-instruct
+```
+
+dbai unloads the current model and loads the new one using LM Studio's `lms` command-line tool. dbai automatically rebuilds context for you, along with any files still added via `/read`, as a single message so the new model picks up where the last one left off. 
+
+Nothing is lost, but note that this context replay is sent as fresh input, so it does add to that turn's token usage.
+
+If loading the new model fails for any reason, dbai attempts to reload your previous model automatically.
 
 ---
 
@@ -122,8 +145,6 @@ gcc hello.c -o hello
 
 The command will **not** execute unless the user enters `yes`.
 
-This approval step is intentional. **Never allow an AI to run arbitrary code without user confirmation.**
-
 ---
 
 ### `/web`
@@ -146,15 +167,13 @@ https://example.com
 
 The page will **not** be fetched unless the user enters `yes`.
 
-A few things worth knowing about how `/web` works:
+How `/web` works:
 
 - **GET only.** dbai never sends any other HTTP method — it can only read pages, never submit forms or trigger actions.
 - **Public URLs only.** Requests to `localhost`, loopback addresses, and private/internal IP ranges (`10.x`, `172.16–31.x`, `192.168.x`, `.local` hosts) are rejected automatically, even if the AI requests them.
 - **HTML is converted to plain text** before being added to context, stripping scripts, styles, and markup so the model gets readable content instead of raw HTML.
-- **Content is capped** at roughly 12,000 characters per page to keep token usage predictable; anything beyond that is truncated.
-- **Up to 3 URLs per request, and up to 3 retrieval rounds** per `/web` command, so the AI can follow up with another page if the first one wasn't enough — without being able to crawl indefinitely.
-
-This approval step is intentional, for the same reason as `/run`: **never let an AI make network requests without user confirmation.**
+- **Content is capped** at roughly 12,000 characters per page to keep token usage predictable, anything beyond that is truncated.
+- **Up to 3 URLs per request, and up to 3 retrieval rounds** per `/web` command, so the AI can follow up with another page if the first one wasn't enough.
 
 ---
 
@@ -191,6 +210,14 @@ lm-studio
 ```
 
 This is the local API configuration used by LM Studio and is not a secret API key.
+
+`/model` also requires LM Studio's `lms` command-line tool to be available on your `PATH`. `lms` ships with LM Studio itself, but needs to be bootstrapped once:
+
+```bash
+~/.lmstudio/bin/lms bootstrap
+```
+
+Open a new terminal afterward and confirm it worked by running `lms`.
 
 ## Disclaimer
 
