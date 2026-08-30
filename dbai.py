@@ -295,6 +295,20 @@ def build_chat_input(pending_inputs, current_input):
     )
 
 
+def find_tag_blocks(answer, tag_name):
+    # Accept both normal XML-like tags and escaped variants such as
+    # \<run_command> sometimes emitted by smaller models.
+    pattern = (
+        rf"(?:\\)?<{tag_name}>\s*(.*?)\s*(?:\\)?</{tag_name}>"
+    )
+
+    return re.findall(
+        pattern,
+        answer,
+        re.DOTALL,
+    )
+
+
 def stream_chat_completion(
     model,
     system_prompt,
@@ -462,8 +476,13 @@ def stream_chat_completion(
     except KeyboardInterrupt:
         raise
 
-    if show_output and started_output:
-        print()
+    if show_output:
+        if not started_output and answer:
+            print(answer, end="", flush=True)
+            started_output = True
+
+        if started_output:
+            print()
 
     return (
         answer,
@@ -573,13 +592,7 @@ def fetch_web_url(url):
 
 def run_web_requests(answer):
     # Find web requests explicitly requested by the AI.
-    pattern = r"<get_url>\s*(.*?)\s*</get_url>"
-
-    matches = re.findall(
-        pattern,
-        answer,
-        re.DOTALL,
-    )
+    matches = find_tag_blocks(answer, "get_url")
 
     if not matches:
         return None
@@ -884,6 +897,23 @@ def write_new_file(path, content):
         return False
 
 
+def normalize_ai_block_text(text):
+    # Some models return one-line XML blocks with escaped newlines.
+    # Convert the common escaped sequences back into real text while
+    # leaving already multi-line content alone.
+    text = text.strip("\n")
+
+    if "\\n" in text and "\n" not in text:
+        text = text.replace("\\n", "\n")
+
+    if "\\t" in text and "\t" not in text:
+        text = text.replace("\\t", "\t")
+
+    text = text.replace('\\"', '"')
+
+    return text
+
+
 def apply_ai_edits(answer):
     # Find targeted edits returned by the AI.
     #
@@ -904,10 +934,10 @@ def apply_ai_edits(answer):
     # incorrectly or the file has changed.
 
     pattern = (
-        r'<edit_file path="([^"]+)">\s*'
-        r'<find>\s*(.*?)\s*</find>\s*'
-        r'<replace>\s*(.*?)\s*</replace>\s*'
-        r'</edit_file>'
+        r'(?:\\)?<edit_file path="([^"]+)">\s*'
+        r'(?:\\)?<find>\s*(.*?)\s*(?:\\)?</find>\s*'
+        r'(?:\\)?<replace>\s*(.*?)\s*(?:\\)?</replace>\s*'
+        r'(?:\\)?</edit_file>'
     )
 
     matches = re.findall(
@@ -919,16 +949,15 @@ def apply_ai_edits(answer):
     # If the AI did not provide the required format,
     # nothing is modified.
     if not matches:
-        print_warning("\nNo valid <edit_file> block returned by the AI.")
-        return
+        return False
 
     # Process every edit requested by the AI.
     for path, find_text, replace_text in matches:
 
         # Remove only the formatting whitespace introduced around
         # the XML-like blocks.
-        find_text = find_text.strip("\n")
-        replace_text = replace_text.strip("\n")
+        find_text = normalize_ai_block_text(find_text)
+        replace_text = normalize_ai_block_text(replace_text)
 
         print_section("FILE EDIT REQUEST", f"File: {path}")
 
@@ -1003,6 +1032,8 @@ def apply_ai_edits(answer):
             # Report file-writing errors without crashing the program.
             print_error(f"\nCould not update {path}: {e}")
 
+    return True
+
 
 def write_ai_files(answer):
     # Find files that the AI requested to create.
@@ -1015,7 +1046,9 @@ def write_ai_files(answer):
     #
     # This is used only when the requested file does not already exist.
 
-    pattern = r'<write_file path="([^"]+)">(.*?)</write_file>'
+    pattern = (
+        r'(?:\\)?<write_file path="([^"]+)">(.*?)(?:\\)?</write_file>'
+    )
 
     matches = re.findall(
         pattern,
@@ -1026,8 +1059,7 @@ def write_ai_files(answer):
     # If the AI did not provide the required format,
     # nothing is written.
     if not matches:
-        print_warning("\nNo valid <write_file> block returned by the AI.")
-        return
+        return False
 
     # Process every file requested by the AI.
     for path, content in matches:
@@ -1046,6 +1078,8 @@ def write_ai_files(answer):
         # Create the brand-new file.
         write_new_file(path, content)
 
+    return True
+
 
 def run_ai_command(answer):
     # Find commands that the AI explicitly requested to execute.
@@ -1058,13 +1092,7 @@ def run_ai_command(answer):
     #
     # Commands outside this format are ignored.
 
-    pattern = r"<run_command>\s*(.*?)\s*</run_command>"
-
-    matches = re.findall(
-        pattern,
-        answer,
-        re.DOTALL,
-    )
+    matches = find_tag_blocks(answer, "run_command")
 
     # If the AI did not provide the required format,
     # nothing is executed.
@@ -1199,6 +1227,49 @@ def run_ai_command(answer):
     return None
 
 
+def get_run_format_retry_prompt(original_request):
+    return (
+        "You did not follow the required /run format.\n\n"
+        f"Original user request:\n{original_request}\n\n"
+        "Output ONLY this exact structure:\n\n"
+        "<run_command>\n"
+        "COMMAND HERE\n"
+        "</run_command>\n\n"
+        "Do not add explanations. "
+        "Do not use markdown code fences. "
+        "Return only the command block."
+    )
+
+
+def get_write_format_retry_prompt(original_request, file_context):
+    return (
+        "You did not follow the required /write format.\n\n"
+        f"Original user request:\n{original_request}\n\n"
+        + (
+            "Relevant existing file context:\n"
+            f"{file_context}\n\n"
+            if file_context
+            else ""
+        )
+        + "Return ONLY one or more of these exact formats:\n\n"
+        '<edit_file path="filename.ext">\n'
+        "<find>\n"
+        "EXACT EXISTING TEXT\n"
+        "</find>\n"
+        "<replace>\n"
+        "NEW TEXT\n"
+        "</replace>\n"
+        "</edit_file>\n\n"
+        "or\n\n"
+        '<write_file path="filename.ext">\n'
+        "COMPLETE FILE CONTENT\n"
+        "</write_file>\n\n"
+        "Do not add explanations. "
+        "Do not use markdown code fences. "
+        "Return only valid edit_file or write_file blocks."
+    )
+
+
 def autocomplete(text, state):
     # Find commands that start with what the user has typed.
     matches = [
@@ -1212,6 +1283,23 @@ def autocomplete(text, state):
         return matches[state]
 
     return None
+
+
+def looks_like_explicit_file_reference(path):
+    # Avoid treating ordinary words in a prompt as filenames.
+    return (
+        "/" in path
+        or "\\" in path
+        or "." in os.path.basename(path)
+    )
+
+
+def is_slash_tool_request(user_input):
+    return (
+        user_input.startswith("/write ")
+        or user_input.startswith("/run ")
+        or user_input.startswith("/web ")
+    )
 
 
 def main():
@@ -1520,6 +1608,9 @@ def main():
                     "\"'`.,:;()[]{}"
                 )
 
+                if not looks_like_explicit_file_reference(cleaned):
+                    continue
+
                 # Add the path if it refers to an existing file.
                 if os.path.isfile(cleaned):
                     existing_files.append(cleaned)
@@ -1630,18 +1721,21 @@ def main():
             request_content = user_input
 
         try:
+            branch_response_id = previous_response_id
+            tool_request = is_slash_tool_request(user_input)
+
             if user_input.startswith("/web "):
                 (
                     answer,
                     last_prompt_tokens,
                     last_completion_tokens,
                     last_total_tokens,
-                    previous_response_id,
+                    branch_response_id,
                 ) = handle_web_request(
                     model,
                     system_prompt,
                     pending_inputs,
-                    previous_response_id,
+                    branch_response_id,
                     request,
                 )
 
@@ -1678,14 +1772,17 @@ def main():
                 model,
                 system_prompt,
                 request_input,
-                previous_response_id=previous_response_id,
+                previous_response_id=branch_response_id,
                 show_output=True,
                 show_progress=True,
             )
 
             if response_id is not None:
-                previous_response_id = response_id
+                branch_response_id = response_id
                 pending_inputs = []
+
+                if not tool_request:
+                    previous_response_id = response_id
 
             if last_prompt_tokens is not None:
                 session_prompt_tokens += last_prompt_tokens
@@ -1699,22 +1796,112 @@ def main():
             if user_input.startswith("/write "):
 
                 # First process targeted edits to existing files.
-                apply_ai_edits(answer)
+                applied_edit = apply_ai_edits(answer)
 
                 # Then process requests for brand-new files.
-                write_ai_files(answer)
+                wrote_file = write_ai_files(answer)
+
+                if not applied_edit and not wrote_file:
+                    print_warning(
+                        "\nModel did not return a valid <edit_file> or "
+                        "<write_file> block. Retrying with stricter "
+                        "format instructions."
+                    )
+
+                    (
+                        answer,
+                        retry_prompt_tokens,
+                        retry_completion_tokens,
+                        retry_total_tokens,
+                        retry_response_id,
+                    ) = stream_chat_completion(
+                        model,
+                        system_prompt,
+                        get_write_format_retry_prompt(
+                            request,
+                            file_context,
+                        ),
+                        previous_response_id=branch_response_id,
+                        show_output=True,
+                        show_progress=True,
+                    )
+
+                    if retry_response_id is not None:
+                        branch_response_id = retry_response_id
+
+                    if retry_prompt_tokens is not None:
+                        last_prompt_tokens = retry_prompt_tokens
+                        last_completion_tokens = (
+                            retry_completion_tokens
+                        )
+                        last_total_tokens = retry_total_tokens
+                        session_prompt_tokens += retry_prompt_tokens
+                        session_completion_tokens += (
+                            retry_completion_tokens
+                        )
+                        session_total_tokens += retry_total_tokens
+
+                    applied_edit = apply_ai_edits(answer)
+                    wrote_file = write_ai_files(answer)
+
+                    if not applied_edit and not wrote_file:
+                        print_warning(
+                            "\nNo valid <edit_file> or <write_file> block "
+                            "returned by the AI."
+                        )
 
             # If this was a /run request, process requested commands.
             command_result = None
 
             if user_input.startswith("/run "):
+                if not find_tag_blocks(answer, "run_command"):
+                    print_warning(
+                        "\nModel did not return a valid <run_command> "
+                        "block. Retrying with stricter format instructions."
+                    )
+
+                    (
+                        answer,
+                        retry_prompt_tokens,
+                        retry_completion_tokens,
+                        retry_total_tokens,
+                        retry_response_id,
+                    ) = stream_chat_completion(
+                        model,
+                        system_prompt,
+                        get_run_format_retry_prompt(request),
+                        previous_response_id=branch_response_id,
+                        show_output=True,
+                        show_progress=True,
+                    )
+
+                    if retry_response_id is not None:
+                        branch_response_id = retry_response_id
+
+                    if retry_prompt_tokens is not None:
+                        last_prompt_tokens = retry_prompt_tokens
+                        last_completion_tokens = (
+                            retry_completion_tokens
+                        )
+                        last_total_tokens = retry_total_tokens
+                        session_prompt_tokens += retry_prompt_tokens
+                        session_completion_tokens += (
+                            retry_completion_tokens
+                        )
+                        session_total_tokens += retry_total_tokens
+
+                if not find_tag_blocks(answer, "run_command"):
+                    print_warning(
+                        "\nNo valid <run_command> block was returned by the AI."
+                    )
+                    continue
 
                 # Ask for approval before executing every command.
                 command_result = run_ai_command(answer)
 
             # If a command was executed or rejected, give the result
             # back to the AI so it knows what happened.
-            if command_result:
+            if command_result and not tool_request:
                 pending_inputs.append(command_result)
 
         except KeyboardInterrupt:
