@@ -28,6 +28,57 @@ client = OpenAI(
 )
 
 
+USE_COLOR = (
+    sys.stdout.isatty()
+    and os.environ.get("TERM", "").lower() != "dumb"
+)
+
+COLOR_RESET = "\033[0m"
+COLOR_BOLD = "\033[1m"
+COLOR_RED = "\033[31m"
+COLOR_GREEN = "\033[32m"
+COLOR_YELLOW = "\033[33m"
+COLOR_BLUE = "\033[34m"
+COLOR_CYAN = "\033[36m"
+
+
+def style_text(text, *styles):
+    # Keep the terminal readable even when ANSI colors are unsupported.
+    if not USE_COLOR:
+        return text
+
+    return f"{''.join(styles)}{text}{COLOR_RESET}"
+
+
+def print_error(text):
+    print(style_text(text, COLOR_BOLD, COLOR_RED))
+
+
+def print_success(text):
+    print(style_text(text, COLOR_BOLD, COLOR_GREEN))
+
+
+def print_warning(text):
+    print(style_text(text, COLOR_BOLD, COLOR_YELLOW))
+
+
+def print_info(text):
+    print(style_text(text, COLOR_CYAN))
+
+
+def print_section(title, body=None, color=COLOR_BLUE):
+    line = style_text("=" * 60, COLOR_BOLD, color)
+    print()
+    print(line)
+    print(style_text(title, COLOR_BOLD, color))
+    print(line)
+
+    if body is not None:
+        print(body)
+        print(line)
+        print()
+
+
 # Commands used for tab autocomplete
 COMMANDS = [
     "/help",
@@ -98,12 +149,12 @@ def get_models():
         models = client.models.list()
 
     except Exception as e:
-        print("Could not connect to LM Studio.")
-        print(
+        print_error("Could not connect to LM Studio.")
+        print_warning(
             "Make sure LM Studio is running and that its local "
             f"server is enabled at {BASE_URL}."
         )
-        print(f"Connection error: {e}")
+        print_error(f"Connection error: {e}")
         sys.exit(1)
 
     loaded_models = [m.id for m in models.data]
@@ -116,8 +167,8 @@ def get_models():
     if available_models:
         return available_models, False
 
-    print("LM Studio is running, but no models are available.")
-    print(
+    print_warning("LM Studio is running, but no models are available.")
+    print_warning(
         "Download or load a model in LM Studio, then try again."
     )
     sys.exit(1)
@@ -235,7 +286,7 @@ def stream_chat_completion(model, messages, show_output=True):
 def handle_generation_interrupt():
     # Keep Ctrl+C focused on cancelling the current model response
     # instead of exiting the whole program.
-    print("\nResponse cancelled.")
+    print_warning("\nResponse cancelled.")
 
 
 def normalize_web_text(content_type, raw_bytes):
@@ -350,16 +401,12 @@ def run_web_requests(answer):
         if not url:
             continue
 
-        print()
-        print("=" * 60)
-        print("WEB REQUEST")
-        print("=" * 60)
-        print(url)
-        print("=" * 60)
-        print()
+        print_section("WEB REQUEST", url, color=COLOR_CYAN)
 
         if not is_allowed_web_url(url):
-            print("Web request rejected: only public http/https URLs are allowed.")
+            print_warning(
+                "Web request rejected: only public http/https URLs are allowed."
+            )
             web_results.append(
                 f"Web request rejected:\n{url}\n\n"
                 "Reason: only public http/https URLs are allowed."
@@ -371,19 +418,19 @@ def run_web_requests(answer):
         ).strip().lower()
 
         if approval != "yes":
-            print("Web request NOT executed.")
+            print_warning("Web request NOT executed.")
             web_results.append(
                 f"Web request was rejected by the user:\n{url}"
             )
             continue
 
-        print("\nFetching URL with GET...\n")
+        print_info("\nFetching URL with GET...\n")
 
         try:
             status, content_type, text = fetch_web_url(url)
 
-            print(f"HTTP status: {status}")
-            print(f"Content-Type: {content_type}")
+            print_success(f"HTTP status: {status}")
+            print_info(f"Content-Type: {content_type}")
 
             web_results.append(
                 f"URL fetched with GET:\n"
@@ -394,7 +441,7 @@ def run_web_requests(answer):
             )
 
         except Exception as e:
-            print(f"Could not fetch URL: {e}")
+            print_error(f"Could not fetch URL: {e}")
             web_results.append(
                 f"URL could not be fetched:\n"
                 f"{url}\n\n"
@@ -539,7 +586,7 @@ def read_files(pattern, already_added=None):
 
     # Stop if the pattern didn't match anything.
     if not files:
-        print(f"No files found: {pattern}")
+        print_warning(f"No files found: {pattern}")
         return "", [], []
 
     # This will hold the contents of all matching files.
@@ -584,7 +631,7 @@ def read_files(pattern, already_added=None):
 
         except Exception as e:
             # If a file can't be read, report the error and continue.
-            print(f"Could not read {path}: {e}")
+            print_error(f"Could not read {path}: {e}")
 
     # Combine all file contents into one string.
     return "\n".join(result), added_files, skipped_files
@@ -601,7 +648,7 @@ def get_file_content(path):
 
     except Exception as e:
         # Report the error without crashing the program.
-        print(f"Could not read {path}: {e}")
+        print_error(f"Could not read {path}: {e}")
         return None
 
 
@@ -619,12 +666,12 @@ def write_new_file(path, content):
         with open(path, "w", encoding="utf-8") as f:
             f.write(content.strip("\n"))
 
-        print(f"\nFile written: {path}")
+        print_success(f"\nFile written: {path}")
         return True
 
     except Exception as e:
         # Report file-writing errors without crashing the program.
-        print(f"\nCould not write {path}: {e}")
+        print_error(f"\nCould not write {path}: {e}")
         return False
 
 
@@ -663,7 +710,7 @@ def apply_ai_edits(answer):
     # If the AI did not provide the required format,
     # nothing is modified.
     if not matches:
-        print("\nNo valid <edit_file> block returned by the AI.")
+        print_warning("\nNo valid <edit_file> block returned by the AI.")
         return
 
     # Process every edit requested by the AI.
@@ -674,16 +721,11 @@ def apply_ai_edits(answer):
         find_text = find_text.strip("\n")
         replace_text = replace_text.strip("\n")
 
-        print()
-        print("=" * 60)
-        print("FILE EDIT REQUEST")
-        print("=" * 60)
-        print(f"File: {path}")
-        print("=" * 60)
+        print_section("FILE EDIT REQUEST", f"File: {path}")
 
         # The file must exist for an edit.
         if not os.path.isfile(path):
-            print("Edit rejected: file does not exist.")
+            print_warning("Edit rejected: file does not exist.")
             continue
 
         # Read the current version of the file.
@@ -697,17 +739,17 @@ def apply_ai_edits(answer):
 
         # Reject the edit if the target text does not exist.
         if match_count == 0:
-            print("Edit rejected: target text was not found.")
-            print("The file was NOT modified.")
+            print_warning("Edit rejected: target text was not found.")
+            print_warning("The file was NOT modified.")
             continue
 
         # Reject the edit if the target text appears more than once.
         if match_count > 1:
-            print(
+            print_warning(
                 f"Edit rejected: target text appears "
                 f"{match_count} times."
             )
-            print("The file was NOT modified.")
+            print_warning("The file was NOT modified.")
             continue
 
         # Show the section that is going to change.
@@ -731,7 +773,7 @@ def apply_ai_edits(answer):
 
         # Only the full word "yes" approves the edit.
         if approval != "yes":
-            print("Edit NOT applied.")
+            print_warning("Edit NOT applied.")
             continue
 
         # Apply exactly one replacement.
@@ -746,11 +788,11 @@ def apply_ai_edits(answer):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(new_content)
 
-            print(f"\nFile updated: {path}")
+            print_success(f"\nFile updated: {path}")
 
         except Exception as e:
             # Report file-writing errors without crashing the program.
-            print(f"\nCould not update {path}: {e}")
+            print_error(f"\nCould not update {path}: {e}")
 
 
 def write_ai_files(answer):
@@ -775,7 +817,7 @@ def write_ai_files(answer):
     # If the AI did not provide the required format,
     # nothing is written.
     if not matches:
-        print("\nNo valid <write_file> block returned by the AI.")
+        print_warning("\nNo valid <write_file> block returned by the AI.")
         return
 
     # Process every file requested by the AI.
@@ -785,15 +827,11 @@ def write_ai_files(answer):
         #
         # Existing files must be modified using <edit_file>.
         if os.path.exists(path):
-            print()
-            print("=" * 60)
-            print("WRITE REJECTED")
-            print("=" * 60)
-            print(f"File already exists: {path}")
-            print(
+            print_section("WRITE REJECTED", f"File already exists: {path}")
+            print_warning(
                 "The AI must use <edit_file> to modify an existing file."
             )
-            print("The existing file was NOT modified.")
+            print_warning("The existing file was NOT modified.")
             continue
 
         # Create the brand-new file.
@@ -822,7 +860,7 @@ def run_ai_command(answer):
     # If the AI did not provide the required format,
     # nothing is executed.
     if not matches:
-        print("\nNo valid <run_command> block was returned by the AI.")
+        print_warning("\nNo valid <run_command> block was returned by the AI.")
         return None
 
     command_results = []
@@ -834,16 +872,10 @@ def run_ai_command(answer):
 
         # Ignore empty command blocks.
         if not command:
-            print("\nEmpty <run_command> block ignored.")
+            print_warning("\nEmpty <run_command> block ignored.")
             continue
 
-        print()
-        print("=" * 60)
-        print("COMMAND REQUEST")
-        print("=" * 60)
-        print(command)
-        print("=" * 60)
-        print()
+        print_section("COMMAND REQUEST", command)
 
         # The command is never executed automatically.
         approval = input(
@@ -854,7 +886,7 @@ def run_ai_command(answer):
         #
         # This is intentionally stricter than accepting "y".
         if approval != "yes":
-            print("Command NOT executed.")
+            print_warning("Command NOT executed.")
 
             # Save the rejection so the AI knows the command
             # was not executed.
@@ -864,7 +896,7 @@ def run_ai_command(answer):
 
             continue
 
-        print("\nExecuting command...\n")
+        print_info("\nExecuting command...\n")
 
         try:
             # Stream command output live so long-running commands do not
@@ -889,7 +921,7 @@ def run_ai_command(answer):
             return_code = process.wait()
 
             print()
-            print(f"Command exited with code: {return_code}")
+            print_success(f"Command exited with code: {return_code}")
 
             # Save the result so the AI can see what happened.
             command_results.append(
@@ -901,7 +933,7 @@ def run_ai_command(answer):
             )
 
         except KeyboardInterrupt:
-            print("\nStopping command...\n")
+            print_warning("\nStopping command...\n")
 
             try:
                 os.killpg(process.pid, signal.SIGINT)
@@ -910,7 +942,9 @@ def run_ai_command(answer):
 
             return_code = process.wait()
 
-            print(f"Command interrupted. Exit code: {return_code}")
+            print_warning(
+                f"Command interrupted. Exit code: {return_code}"
+            )
 
             command_results.append(
                 f"Command was interrupted by the user:\n"
@@ -921,7 +955,7 @@ def run_ai_command(answer):
         except Exception as e:
             # Report command execution errors without crashing
             # the entire program.
-            print(f"\nCould not execute command: {e}")
+            print_error(f"\nCould not execute command: {e}")
 
             command_results.append(
                 f"Command could not be executed:\n"
@@ -961,7 +995,7 @@ def main():
     models, has_loaded_model = get_models()
 
     # Display the available models.
-    print("Available models:")
+    print_info("Available models:")
 
     for i, model in enumerate(models, 1):
         print(f"  {i}. {model}")
@@ -975,17 +1009,17 @@ def main():
 
     except (ValueError, IndexError):
         # Handle invalid model selections.
-        print("Invalid selection.")
+        print_error("Invalid selection.")
         sys.exit(1)
 
     if not has_loaded_model:
-        print(
+        print_info(
             f"\nNo model is currently loaded in LM Studio. "
             f"Loading {model} now..."
         )
 
     # Show the selected model.
-    print(f"\nUsing: {model}")
+    print_success(f"\nUsing: {model}")
 
     host_os = platform.system()
     host_shell = os.environ.get("SHELL", "unknown")
@@ -1073,10 +1107,18 @@ def main():
     session_completion_tokens = 0
     session_total_tokens = 0
 
+    # Keep a blank line between command output and the next prompt.
+    first_prompt = True
+
     # Main interactive chat loop.
     while True:
 
         try:
+            if first_prompt:
+                first_prompt = False
+            else:
+                print()
+
             # Display the current working directory before the prompt.
             user_input = input(
                 f"{os.getcwd()} dbai> "
@@ -1116,7 +1158,7 @@ def main():
 
             # Show a message if no model request has been completed yet.
             if last_prompt_tokens is None:
-                print("No token count available yet.")
+                print_warning("No token count available yet.")
 
             else:
                 # Display cumulative token counts for the current session.
@@ -1150,7 +1192,7 @@ def main():
             # Clear the list of files added to the conversation.
             read_files_list = []
 
-            print("Conversation cleared.")
+            print_success("Conversation cleared.")
 
             continue
 
@@ -1176,13 +1218,13 @@ def main():
 
             # Tell the user if no files have been added.
             if not read_files_list:
-                print(
+                print_warning(
                     "No files have been added to the conversation."
                 )
 
             else:
                 # Display every file currently in the conversation.
-                print("Files currently added:")
+                print_info("Files currently added:")
 
                 for path in read_files_list:
                     print(f"  {path}")
@@ -1215,12 +1257,12 @@ def main():
                 # Remember which files were added.
                 read_files_list.extend(added_files)
 
-                print(
+                print_success(
                     f"Added files matching: {pattern}"
                 )
 
             if skipped_files:
-                print("Already in context, skipped:")
+                print_warning("Already in context, skipped:")
 
                 for path in skipped_files:
                     print(f"  {path}")
@@ -1233,7 +1275,7 @@ def main():
             request = user_input[7:].strip()
 
             if not request:
-                print("Usage: /write DESCRIPTION")
+                print_warning("Usage: /write DESCRIPTION")
                 continue
 
             # Determine whether the user explicitly named an existing
@@ -1331,7 +1373,7 @@ def main():
             request = user_input[5:].strip()
 
             if not request:
-                print("Usage: /run DESCRIPTION")
+                print_warning("Usage: /run DESCRIPTION")
                 continue
 
             # Tell the AI to generate a terminal command.
@@ -1360,7 +1402,7 @@ def main():
             request = user_input[5:].strip()
 
             if not request:
-                print("Usage: /web DESCRIPTION_OR_URL")
+                print_warning("Usage: /web DESCRIPTION_OR_URL")
                 continue
 
         else:
@@ -1462,7 +1504,7 @@ def main():
 
             # Display API or connection errors without crashing
             # the entire program.
-            print(f"\nError: {e}")
+            print_error(f"\nError: {e}")
 
 
 # Only run main() when this file is executed directly.
