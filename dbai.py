@@ -231,6 +231,12 @@ def stream_chat_completion(model, messages, show_output=True):
     )
 
 
+def handle_generation_interrupt():
+    # Keep Ctrl+C focused on cancelling the current model response
+    # instead of exiting the whole program.
+    print("\nResponse cancelled.")
+
+
 def normalize_web_text(content_type, raw_bytes):
     # Convert downloaded data into plain text that is useful to the AI.
     content_type = (content_type or "").lower()
@@ -1414,6 +1420,9 @@ def main():
                     "role": "user",
                     "content": command_result,
                 })
+
+        except KeyboardInterrupt:
+            handle_generation_interrupt()
 
         except Exception as e:
 
