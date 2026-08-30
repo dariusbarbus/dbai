@@ -117,9 +117,121 @@ def append_run_audit_log(command, status, exit_code=None, output=None):
         print_error(f"Could not write run audit log: {e}")
 
 
+def run_lms_command(args):
+    # Run an LM Studio CLI command directly.
+    return subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+    )
+
+
+def get_selectable_models():
+    # Prefer the full model catalog so /model can switch to unloaded models.
+    models = get_lm_studio_available_models()
+
+    if models:
+        return models
+
+    loaded_models, _ = get_models()
+    return loaded_models
+
+
+def build_restore_context(conversation_turns, read_files_list):
+    # Rebuild local chat context for a newly loaded model.
+    parts = [
+        "The user switched to a different model. "
+        "Treat everything below as prior conversation context and "
+        "continue naturally from it."
+    ]
+
+    if conversation_turns:
+        transcript = []
+
+        for turn in conversation_turns:
+            transcript.append(
+                f"{turn['role'].capitalize()}: {turn['content']}"
+            )
+
+        parts.append(
+            "Conversation so far:\n\n"
+            + "\n\n".join(transcript)
+        )
+
+    if read_files_list:
+        file_blocks = []
+
+        for path in read_files_list:
+            content = get_file_content(path)
+
+            if content is None:
+                continue
+
+            file_blocks.append(
+                f"===== FILE STILL IN CONTEXT: {path} =====\n"
+                f"{content}\n"
+                f"===== END FILE ====="
+            )
+
+        if file_blocks:
+            parts.append(
+                "These files are still in context:\n\n"
+                + "\n\n".join(file_blocks)
+            )
+
+    return "\n\n".join(parts)
+
+
+def hot_swap_model(current_model, new_model):
+    # Unload the current model and load the selected one.
+    if new_model == current_model:
+        print_warning(f"{new_model} is already selected.")
+        return False
+
+    print_info(f"\nUnloading {current_model}...")
+    unload_result = run_lms_command(["lms", "unload", current_model])
+
+    if unload_result.stdout.strip():
+        print(unload_result.stdout.strip())
+
+    if unload_result.returncode != 0:
+        if unload_result.stderr.strip():
+            print_error(unload_result.stderr.strip())
+        print_error("Could not unload the current model.")
+        return False
+
+    print_info(f"\nLoading {new_model}...")
+    load_result = run_lms_command(["lms", "load", new_model])
+
+    if load_result.stdout.strip():
+        print(load_result.stdout.strip())
+
+    if load_result.returncode != 0:
+        if load_result.stderr.strip():
+            print_error(load_result.stderr.strip())
+        print_error("Could not load the selected model.")
+
+        print_warning(
+            f"Attempting to reload the previous model: {current_model}"
+        )
+        reload_result = run_lms_command(["lms", "load", current_model])
+
+        if reload_result.stdout.strip():
+            print(reload_result.stdout.strip())
+
+        if reload_result.returncode != 0 and reload_result.stderr.strip():
+            print_error(reload_result.stderr.strip())
+
+        return False
+
+    print_success(f"\nNow using: {new_model}")
+    return True
+
+
 # Commands used for tab autocomplete
 COMMANDS = [
     "/help",
+    "/model",
     "/files",
     "/read",
     "/read-ls",
@@ -1297,6 +1409,7 @@ def looks_like_explicit_file_reference(path):
 def is_slash_tool_request(user_input):
     return (
         user_input.startswith("/write ")
+        or user_input.startswith("/model")
         or user_input.startswith("/run ")
         or user_input.startswith("/web ")
     )
@@ -1411,6 +1524,9 @@ def main():
     # Local inputs that should be included in the next model request.
     pending_inputs = []
 
+    # Local transcript used to restore context after a model swap.
+    conversation_turns = []
+
     # Files currently added through /read.
     read_files_list = []
 
@@ -1458,6 +1574,7 @@ def main():
             print()
             print("Available commands:")
             print("  /help        Show available commands")
+            print("  /model       Switch to a different model")
             print("  /files       List files in current directory")
             print("  /read FILE   Add a file to context")
             print("  /read-ls     List files currently added to context")
@@ -1495,6 +1612,7 @@ def main():
 
             previous_response_id = None
             pending_inputs = []
+            conversation_turns = []
 
             # Reset the displayed token information.
             last_prompt_tokens = None
@@ -1510,6 +1628,68 @@ def main():
             read_files_list = []
 
             print_success("Conversation cleared.")
+
+            continue
+
+        if user_input == "/model" or user_input.startswith("/model "):
+
+            selectable_models = get_selectable_models()
+
+            if not selectable_models:
+                print_warning("No models are available to select.")
+                continue
+
+            requested_model = user_input[6:].strip()
+
+            if requested_model:
+                if requested_model not in selectable_models:
+                    print_warning(
+                        f"Model not found: {requested_model}"
+                    )
+                    continue
+
+                next_model = requested_model
+
+            else:
+                print_info("Available models:")
+
+                for i, selectable_model in enumerate(
+                    selectable_models,
+                    1,
+                ):
+                    current_marker = ""
+
+                    if selectable_model == model:
+                        current_marker = " [current]"
+
+                    print(
+                        f"  {i}. {selectable_model}{current_marker}"
+                    )
+
+                choice = input("\nSelect model: ").strip()
+
+                try:
+                    next_model = selectable_models[int(choice) - 1]
+                except (ValueError, IndexError):
+                    print_error("Invalid selection.")
+                    continue
+
+            if hot_swap_model(model, next_model):
+                restore_context = build_restore_context(
+                    conversation_turns,
+                    read_files_list,
+                )
+
+                model = next_model
+                previous_response_id = None
+                pending_inputs = []
+
+                if restore_context.strip():
+                    pending_inputs.append(restore_context)
+
+                print_info(
+                    "Chat context will be restored for the next prompt."
+                )
 
             continue
 
@@ -1748,6 +1928,15 @@ def main():
                     )
                     session_total_tokens += last_total_tokens
 
+                conversation_turns.append({
+                    "role": "user",
+                    "content": user_input,
+                })
+                conversation_turns.append({
+                    "role": "assistant",
+                    "content": answer,
+                })
+
                 continue
 
             # Send the entire conversation history to LM Studio.
@@ -1850,6 +2039,15 @@ def main():
                             "returned by the AI."
                         )
 
+                conversation_turns.append({
+                    "role": "user",
+                    "content": user_input,
+                })
+                conversation_turns.append({
+                    "role": "assistant",
+                    "content": answer,
+                })
+
             # If this was a /run request, process requested commands.
             command_result = None
 
@@ -1898,6 +2096,35 @@ def main():
 
                 # Ask for approval before executing every command.
                 command_result = run_ai_command(answer)
+
+                conversation_turns.append({
+                    "role": "user",
+                    "content": user_input,
+                })
+                conversation_turns.append({
+                    "role": "assistant",
+                    "content": answer,
+                })
+
+            elif user_input.startswith("/web "):
+                conversation_turns.append({
+                    "role": "user",
+                    "content": user_input,
+                })
+                conversation_turns.append({
+                    "role": "assistant",
+                    "content": answer,
+                })
+
+            elif not is_slash_tool_request(user_input):
+                conversation_turns.append({
+                    "role": "user",
+                    "content": user_input,
+                })
+                conversation_turns.append({
+                    "role": "assistant",
+                    "content": answer,
+                })
 
             # If a command was executed or rejected, give the result
             # back to the AI so it knows what happened.
