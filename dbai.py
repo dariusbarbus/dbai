@@ -1063,10 +1063,15 @@ def main():
     # Files currently added through /read.
     read_files_list = []
 
-    # Token information reported by LM Studio.
+    # Token information reported by LM Studio for the most recent request.
     last_prompt_tokens = None
     last_completion_tokens = None
     last_total_tokens = None
+
+    # Cumulative token usage for the current session.
+    session_prompt_tokens = 0
+    session_completion_tokens = 0
+    session_total_tokens = 0
 
     # Main interactive chat loop.
     while True:
@@ -1114,15 +1119,15 @@ def main():
                 print("No token count available yet.")
 
             else:
-                # Display the token counts reported by LM Studio.
+                # Display cumulative token counts for the current session.
                 print(
-                    f"Prompt tokens:     {last_prompt_tokens:,}"
+                    f"Session prompt tokens:     {session_prompt_tokens:,}"
                 )
                 print(
-                    f"Completion tokens: {last_completion_tokens:,}"
+                    f"Session completion tokens: {session_completion_tokens:,}"
                 )
                 print(
-                    f"Total tokens:      {last_total_tokens:,}"
+                    f"Session total tokens:      {session_total_tokens:,}"
                 )
 
             continue
@@ -1136,6 +1141,11 @@ def main():
             last_prompt_tokens = None
             last_completion_tokens = None
             last_total_tokens = None
+
+            # Reset cumulative session token information too.
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_total_tokens = 0
 
             # Clear the list of files added to the conversation.
             read_files_list = []
@@ -1377,6 +1387,14 @@ def main():
                 )
 
                 messages.extend(new_messages)
+
+                if last_prompt_tokens is not None:
+                    session_prompt_tokens += last_prompt_tokens
+                    session_completion_tokens += (
+                        last_completion_tokens
+                    )
+                    session_total_tokens += last_total_tokens
+
                 continue
 
             # Send the entire conversation history to LM Studio.
@@ -1396,6 +1414,13 @@ def main():
                 messages,
                 show_output=True,
             )
+
+            if last_prompt_tokens is not None:
+                session_prompt_tokens += last_prompt_tokens
+                session_completion_tokens += (
+                    last_completion_tokens
+                )
+                session_total_tokens += last_total_tokens
 
             # If this was a /write request, process targeted edits
             # and new file creation requests.
