@@ -34,6 +34,10 @@ RUN_AUDIT_LOG = os.path.join(
     "dbai_run_audit.log",
 )
 
+LM_STUDIO_CHAT_URL = (
+    BASE_URL.rsplit("/v1", 1)[0] + "/api/v1/chat"
+)
+
 
 USE_COLOR = (
     sys.stdout.isatty()
@@ -264,49 +268,201 @@ def get_lm_studio_available_models():
     return model_ids
 
 
-def stream_chat_completion(model, messages, show_output=True):
-    # Send the conversation to LM Studio and optionally stream it
-    # to the terminal.
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0.2,
-        stream=True,
-        stream_options={
-            "include_usage": True
-        },
+def get_lm_studio_headers(accept):
+    headers = {
+        "Accept": accept,
+        "Content-Type": "application/json",
+        "User-Agent": "dbai/1.0",
+    }
+
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
+
+    return headers
+
+
+def build_chat_input(pending_inputs, current_input):
+    # Combine queued context and the current user request into a single
+    # chat input for LM Studio's stateful chat endpoint.
+    parts = list(pending_inputs)
+
+    if current_input:
+        parts.append(current_input)
+
+    return "\n\n".join(
+        part for part in parts
+        if part
+    )
+
+
+def stream_chat_completion(
+    model,
+    system_prompt,
+    input_text,
+    previous_response_id=None,
+    show_output=True,
+    show_progress=True,
+):
+    # Send the conversation to LM Studio's native SSE chat endpoint so
+    # prompt-processing and model-loading progress can be displayed.
+    payload = {
+        "model": model,
+        "input": input_text,
+        "system_prompt": system_prompt,
+        "stream": True,
+        "temperature": 0.2,
+    }
+
+    if previous_response_id is not None:
+        payload["previous_response_id"] = previous_response_id
+
+    request = Request(
+        LM_STUDIO_CHAT_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=get_lm_studio_headers("text/event-stream"),
+        method="POST",
     )
 
     answer = ""
     prompt_tokens = None
     completion_tokens = None
     total_tokens = None
+    response_id = None
+    progress_visible = False
+    started_output = False
 
-    if show_output:
+    def show_progress_line(label, progress):
+        nonlocal progress_visible
+
+        if not show_progress:
+            return
+
+        percent = max(0, min(100, int(progress * 100)))
+        text = style_text(
+            f"\r{label}: {percent:3d}%".ljust(40),
+            COLOR_CYAN,
+        )
+        print(text, end="", flush=True)
+        progress_visible = True
+
+    def finish_progress_line():
+        nonlocal progress_visible
+
+        if progress_visible:
+            print()
+            progress_visible = False
+
+    if show_output or show_progress:
         print()
 
-    for chunk in response:
-        if chunk.usage is not None:
-            prompt_tokens = chunk.usage.prompt_tokens
-            completion_tokens = chunk.usage.completion_tokens
-            total_tokens = chunk.usage.total_tokens
+    try:
+        with urlopen(request, timeout=3600) as response:
+            event_name = None
+            data_lines = []
 
-        if not chunk.choices:
-            continue
+            for raw_line in response:
+                line = raw_line.decode(
+                    "utf-8",
+                    errors="replace",
+                ).rstrip("\r\n")
 
-        text = chunk.choices[0].delta.content
+                if not line:
+                    if event_name:
+                        raw_data = "\n".join(data_lines)
+                        event_data = {}
 
-        if text:
-            if show_output:
-                print(
-                    text,
-                    end="",
-                    flush=True
-                )
+                        if raw_data:
+                            event_data = json.loads(raw_data)
 
-            answer += text
+                        if event_name == "model_load.progress":
+                            show_progress_line(
+                                "Loading model",
+                                event_data.get("progress", 0),
+                            )
 
-    if show_output:
+                        elif event_name == "model_load.end":
+                            show_progress_line("Loading model", 1.0)
+                            finish_progress_line()
+
+                        elif event_name == "prompt_processing.progress":
+                            show_progress_line(
+                                "Processing prompt",
+                                event_data.get("progress", 0),
+                            )
+
+                        elif event_name == "prompt_processing.end":
+                            show_progress_line("Processing prompt", 1.0)
+                            finish_progress_line()
+
+                        elif event_name == "message.delta":
+                            finish_progress_line()
+                            text = event_data.get("content", "")
+
+                            if text:
+                                if show_output:
+                                    print(
+                                        text,
+                                        end="",
+                                        flush=True,
+                                    )
+                                    started_output = True
+
+                                answer += text
+
+                        elif event_name == "error":
+                            finish_progress_line()
+                            error_message = (
+                                event_data.get("error")
+                                or event_data.get("message")
+                                or "Unknown LM Studio error."
+                            )
+                            raise RuntimeError(error_message)
+
+                        elif event_name == "chat.end":
+                            finish_progress_line()
+                            result = event_data.get("result", {})
+                            stats = result.get("stats", {})
+
+                            prompt_tokens = stats.get("input_tokens")
+                            completion_tokens = stats.get(
+                                "total_output_tokens"
+                            )
+
+                            if (
+                                prompt_tokens is not None
+                                and completion_tokens is not None
+                            ):
+                                total_tokens = (
+                                    prompt_tokens
+                                    + completion_tokens
+                                )
+
+                            response_id = result.get("response_id")
+
+                            if not answer:
+                                output_items = result.get("output", [])
+                                answer = "".join(
+                                    item.get("content", "")
+                                    for item in output_items
+                                    if item.get("type") == "message"
+                                )
+
+                        event_name = None
+                        data_lines = []
+
+                    continue
+
+                if line.startswith("event:"):
+                    event_name = line[6:].strip()
+                    continue
+
+                if line.startswith("data:"):
+                    data_lines.append(line[5:].strip())
+
+    except KeyboardInterrupt:
+        raise
+
+    if show_output and started_output:
         print()
 
     return (
@@ -314,6 +470,7 @@ def stream_chat_completion(model, messages, show_output=True):
         prompt_tokens,
         completion_tokens,
         total_tokens,
+        response_id,
     )
 
 
@@ -488,14 +645,17 @@ def run_web_requests(answer):
     return None
 
 
-def handle_web_request(model, messages, request):
+def handle_web_request(
+    model,
+    system_prompt,
+    pending_inputs,
+    previous_response_id,
+    request,
+):
     # Let the AI request URLs in a few short GET-only rounds.
-    original_length = len(messages)
-    web_messages = list(messages)
-
-    web_messages.append({
-        "role": "user",
-        "content": (
+    request_input = build_chat_input(
+        pending_inputs,
+        (
             "The user wants you to access the web using GET only.\n\n"
             f"User request:\n{request}\n\n"
             "If you need a web page, output ONLY one or more URLs in "
@@ -514,26 +674,37 @@ def handle_web_request(model, messages, request):
             "- If you need search, a GET URL such as "
             "https://html.duckduckgo.com/html/?q=YOUR+QUERY is allowed."
         ),
-    })
+    )
 
     final_answer = None
-    prompt_tokens = None
-    completion_tokens = None
-    total_tokens = None
+    final_response_id = previous_response_id
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_tokens = 0
 
     for round_number in range(3):
-        answer, prompt_tokens, completion_tokens, total_tokens = (
-            stream_chat_completion(
-                model,
-                web_messages,
-                show_output=False,
-            )
+        (
+            answer,
+            prompt_tokens,
+            completion_tokens,
+            round_total_tokens,
+            response_id,
+        ) = stream_chat_completion(
+            model,
+            system_prompt,
+            request_input,
+            previous_response_id=final_response_id,
+            show_output=False,
+            show_progress=True,
         )
 
-        web_messages.append({
-            "role": "assistant",
-            "content": answer,
-        })
+        if prompt_tokens is not None:
+            total_prompt_tokens += prompt_tokens
+            total_completion_tokens += completion_tokens or 0
+            total_tokens += round_total_tokens or 0
+
+        if response_id is not None:
+            final_response_id = response_id
 
         web_result = run_web_requests(answer)
 
@@ -542,51 +713,55 @@ def handle_web_request(model, messages, request):
             break
 
         if round_number == 2:
-            web_messages.append({
-                "role": "user",
-                "content": (
-                    f"{web_result}\n\n"
-                    "This was the last allowed web retrieval round. "
-                    "Answer the user's request now without requesting "
-                    "another URL."
-                ),
-            })
+            request_input = (
+                f"{web_result}\n\n"
+                "This was the last allowed web retrieval round. "
+                "Answer the user's request now without requesting "
+                "another URL."
+            )
             break
 
-        web_messages.append({
-            "role": "user",
-            "content": (
-                f"{web_result}\n\n"
-                "Use the retrieved content above. "
-                "If you still need more web information, you may request "
-                "more URLs with <get_url>. Otherwise answer normally."
-            ),
-        })
-
-    if final_answer is None:
-        final_answer, prompt_tokens, completion_tokens, total_tokens = (
-            stream_chat_completion(
-                model,
-                web_messages,
-                show_output=True,
-            )
+        request_input = (
+            f"{web_result}\n\n"
+            "Use the retrieved content above. "
+            "If you still need more web information, you may request "
+            "more URLs with <get_url>. Otherwise answer normally."
         )
 
-        web_messages.append({
-            "role": "assistant",
-            "content": final_answer,
-        })
+    if final_answer is None:
+        (
+            final_answer,
+            prompt_tokens,
+            completion_tokens,
+            round_total_tokens,
+            response_id,
+        ) = stream_chat_completion(
+            model,
+            system_prompt,
+            request_input,
+            previous_response_id=final_response_id,
+            show_output=True,
+            show_progress=True,
+        )
+
+        if prompt_tokens is not None:
+            total_prompt_tokens += prompt_tokens
+            total_completion_tokens += completion_tokens or 0
+            total_tokens += round_total_tokens or 0
+
+        if response_id is not None:
+            final_response_id = response_id
 
     else:
         print()
         print(final_answer)
 
     return (
-        web_messages[original_length:],
         final_answer,
-        prompt_tokens,
-        completion_tokens,
+        total_prompt_tokens,
+        total_completion_tokens,
         total_tokens,
+        final_response_id,
     )
 
 
@@ -1078,75 +1253,75 @@ def main():
     host_os = platform.system()
     host_shell = os.environ.get("SHELL", "unknown")
 
-    # Conversation history sent to the model.
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a helpful local AI assistant. "
-                "Follow the user's instructions exactly. "
+    system_prompt = (
+        "You are a helpful local AI assistant. "
+        "Follow the user's instructions exactly. "
 
-                "Answer normal questions normally. "
+        "Answer normal questions normally. "
 
-                "When files are provided, use their contents as context. "
+        "When files are provided, use their contents as context. "
 
-                f"You are running on {host_os}. "
-                f"The user's shell is {host_shell}. "
-                "When suggesting commands, prefer syntax and flags that "
-                "fit that environment. "
+        f"You are running on {host_os}. "
+        f"The user's shell is {host_shell}. "
+        "When suggesting commands, prefer syntax and flags that "
+        "fit that environment. "
 
-                "When the user uses /write, you are allowed to create "
-                "or modify files. "
+        "When the user uses /write, you are allowed to create "
+        "or modify files. "
 
-                "IMPORTANT /write RULES: "
+        "IMPORTANT /write RULES: "
 
-                "If the requested file does NOT exist, create it using "
-                "exactly this format: "
-                "<write_file path=\"filename.ext\">FILE CONTENT</write_file>. "
+        "If the requested file does NOT exist, create it using "
+        "exactly this format: "
+        "<write_file path=\"filename.ext\">FILE CONTENT</write_file>. "
 
-                "If the requested file ALREADY EXISTS, NEVER regenerate "
-                "the entire file. Instead create a targeted edit using "
-                "exactly this format: "
-                "<edit_file path=\"filename.ext\">"
-                "<find>EXACT EXISTING TEXT</find>"
-                "<replace>NEW TEXT</replace>"
-                "</edit_file>. "
+        "If the requested file ALREADY EXISTS, NEVER regenerate "
+        "the entire file. Instead create a targeted edit using "
+        "exactly this format: "
+        "<edit_file path=\"filename.ext\">"
+        "<find>EXACT EXISTING TEXT</find>"
+        "<replace>NEW TEXT</replace>"
+        "</edit_file>. "
 
-                "The find section must contain text copied exactly from "
-                "the existing file. "
+        "The find section must contain text copied exactly from "
+        "the existing file. "
 
-                "Only include the smallest relevant section necessary "
-                "for the requested change. "
+        "Only include the smallest relevant section necessary "
+        "for the requested change. "
 
-                "Do not remove or rewrite unrelated existing code. "
+        "Do not remove or rewrite unrelated existing code. "
 
-                "Do not use markdown code fences inside write_file or "
-                "edit_file blocks. "
+        "Do not use markdown code fences inside write_file or "
+        "edit_file blocks. "
 
-                "Never use write_file for an existing file. "
+        "Never use write_file for an existing file. "
 
-                "When the user uses /run, generate terminal commands "
-                "using ONLY the required <run_command> format. "
+        "When the user uses /run, generate terminal commands "
+        "using ONLY the required <run_command> format. "
 
-                "Never put executable commands outside a "
-                "<run_command> block. "
+        "Never put executable commands outside a "
+        "<run_command> block. "
 
-                "When the user uses /web, you may request public web "
-                "pages using ONLY the required <get_url> format. "
+        "When the user uses /web, you may request public web "
+        "pages using ONLY the required <get_url> format. "
 
-                "Never put URLs to fetch outside a <get_url> block "
-                "during /web tool use. "
+        "Never put URLs to fetch outside a <get_url> block "
+        "during /web tool use. "
 
-                "Use only public http or https URLs for /web. "
+        "Use only public http or https URLs for /web. "
 
-                "Never assume a URL has been approved or fetched. "
+        "Never assume a URL has been approved or fetched. "
 
-                "Never assume a command has been approved. "
-                "The terminal program will ask the user for approval "
-                "before executing every command or web request."
-            ),
-        }
-    ]
+        "Never assume a command has been approved. "
+        "The terminal program will ask the user for approval "
+        "before executing every command or web request."
+    )
+
+    # Tracks the LM Studio conversation thread for this dbai session.
+    previous_response_id = None
+
+    # Local inputs that should be included in the next model request.
+    pending_inputs = []
 
     # Files currently added through /read.
     read_files_list = []
@@ -1230,8 +1405,8 @@ def main():
 
         if user_input == "/clear":
 
-            # messages[0] is the system message, so keep only that.
-            messages = messages[:1]
+            previous_response_id = None
+            pending_inputs = []
 
             # Reset the displayed token information.
             last_prompt_tokens = None
@@ -1299,14 +1474,10 @@ def main():
             # Only add files to the conversation if content was found.
             if content:
 
-                # Add the file contents as a user message.
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "Here are the files I want you to read:\n\n"
-                        f"{content}"
-                    ),
-                })
+                pending_inputs.append(
+                    "Here are the files I want you to read:\n\n"
+                    f"{content}"
+                )
 
                 # Remember which files were added.
                 read_files_list.extend(added_files)
@@ -1371,55 +1542,52 @@ def main():
 
             # Tell the AI whether it needs to create a new file
             # or make a targeted edit to an existing file.
-            messages.append({
-                "role": "user",
-                "content": (
-                    "The user wants you to create or modify a file.\n\n"
-                    f"User request:\n{request}\n\n"
+            request_content = (
+                "The user wants you to create or modify a file.\n\n"
+                f"User request:\n{request}\n\n"
 
-                    + (
-                        "The following file already exists. "
-                        "Modify ONLY the necessary section. "
-                        "Do NOT regenerate the whole file:\n"
-                        f"{file_context}\n"
-                        if file_context
-                        else
-                        "No existing file was found from the request. "
-                        "If a new file is needed, create it with "
-                        "<write_file>.\n"
-                    )
+                + (
+                    "The following file already exists. "
+                    "Modify ONLY the necessary section. "
+                    "Do NOT regenerate the whole file:\n"
+                    f"{file_context}\n"
+                    if file_context
+                    else
+                    "No existing file was found from the request. "
+                    "If a new file is needed, create it with "
+                    "<write_file>.\n"
+                )
 
-                    +
+                +
 
-                    "For an existing file, output ONLY a targeted "
-                    "<edit_file> block using this exact structure:\n\n"
+                "For an existing file, output ONLY a targeted "
+                "<edit_file> block using this exact structure:\n\n"
 
-                    '<edit_file path="filename.ext">\n'
-                    "<find>\n"
-                    "EXACT EXISTING TEXT\n"
-                    "</find>\n"
-                    "<replace>\n"
-                    "NEW TEXT\n"
-                    "</replace>\n"
-                    "</edit_file>\n\n"
+                '<edit_file path="filename.ext">\n'
+                "<find>\n"
+                "EXACT EXISTING TEXT\n"
+                "</find>\n"
+                "<replace>\n"
+                "NEW TEXT\n"
+                "</replace>\n"
+                "</edit_file>\n\n"
 
-                    "The text inside <find> MUST match the existing "
-                    "file exactly. "
+                "The text inside <find> MUST match the existing "
+                "file exactly. "
 
-                    "Only include the smallest section necessary "
-                    "for the requested change. "
+                "Only include the smallest section necessary "
+                "for the requested change. "
 
-                    "Do not modify unrelated code. "
+                "Do not modify unrelated code. "
 
-                    "If the file does not exist, use:\n\n"
+                "If the file does not exist, use:\n\n"
 
-                    '<write_file path="filename.ext">\n'
-                    "COMPLETE FILE CONTENT\n"
-                    "</write_file>\n\n"
+                '<write_file path="filename.ext">\n'
+                "COMPLETE FILE CONTENT\n"
+                "</write_file>\n\n"
 
-                    "Do not use markdown code fences."
-                ),
-            })
+                "Do not use markdown code fences."
+            )
 
         elif user_input.startswith("/run "):
 
@@ -1431,25 +1599,22 @@ def main():
                 continue
 
             # Tell the AI to generate a terminal command.
-            messages.append({
-                "role": "user",
-                "content": (
-                    "The user wants to execute a terminal command.\n\n"
-                    f"User request:\n{request}\n\n"
-                    "Determine the appropriate terminal command.\n\n"
-                    "IMPORTANT:\n"
-                    "Output the command ONLY inside this exact format:\n\n"
-                    "<run_command>\n"
-                    "COMMAND HERE\n"
-                    "</run_command>\n\n"
-                    "Do not put executable commands outside the "
-                    "<run_command> block. "
-                    "Do not use markdown code fences. "
-                    "Do not claim that the command was executed. "
-                    "The terminal program will ask the user for approval "
-                    "before executing it."
-                ),
-            })
+            request_content = (
+                "The user wants to execute a terminal command.\n\n"
+                f"User request:\n{request}\n\n"
+                "Determine the appropriate terminal command.\n\n"
+                "IMPORTANT:\n"
+                "Output the command ONLY inside this exact format:\n\n"
+                "<run_command>\n"
+                "COMMAND HERE\n"
+                "</run_command>\n\n"
+                "Do not put executable commands outside the "
+                "<run_command> block. "
+                "Do not use markdown code fences. "
+                "Do not claim that the command was executed. "
+                "The terminal program will ask the user for approval "
+                "before executing it."
+            )
 
         elif user_input.startswith("/web "):
 
@@ -1460,29 +1625,27 @@ def main():
                 continue
 
         else:
-
             # Anything that isn't a recognized command is treated as
             # a normal message for the AI.
-            messages.append({
-                "role": "user",
-                "content": user_input,
-            })
+            request_content = user_input
 
         try:
             if user_input.startswith("/web "):
                 (
-                    new_messages,
                     answer,
                     last_prompt_tokens,
                     last_completion_tokens,
                     last_total_tokens,
+                    previous_response_id,
                 ) = handle_web_request(
                     model,
-                    messages,
+                    system_prompt,
+                    pending_inputs,
+                    previous_response_id,
                     request,
                 )
 
-                messages.extend(new_messages)
+                pending_inputs = []
 
                 if last_prompt_tokens is not None:
                     session_prompt_tokens += last_prompt_tokens
@@ -1500,16 +1663,29 @@ def main():
             #
             # include_usage=True asks LM Studio to include actual token
             # usage information in the streaming response.
+            request_input = build_chat_input(
+                pending_inputs,
+                request_content,
+            )
+
             (
                 answer,
                 last_prompt_tokens,
                 last_completion_tokens,
                 last_total_tokens,
+                response_id,
             ) = stream_chat_completion(
                 model,
-                messages,
+                system_prompt,
+                request_input,
+                previous_response_id=previous_response_id,
                 show_output=True,
+                show_progress=True,
             )
+
+            if response_id is not None:
+                previous_response_id = response_id
+                pending_inputs = []
 
             if last_prompt_tokens is not None:
                 session_prompt_tokens += last_prompt_tokens
@@ -1536,20 +1712,10 @@ def main():
                 # Ask for approval before executing every command.
                 command_result = run_ai_command(answer)
 
-            # Add the completed AI response to the conversation history.
-            messages.append({
-                "role": "assistant",
-                "content": answer,
-            })
-
             # If a command was executed or rejected, give the result
             # back to the AI so it knows what happened.
             if command_result:
-
-                messages.append({
-                    "role": "user",
-                    "content": command_result,
-                })
+                pending_inputs.append(command_result)
 
         except KeyboardInterrupt:
             handle_generation_interrupt()
