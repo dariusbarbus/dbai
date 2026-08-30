@@ -9,6 +9,7 @@ import readline
 import re
 import signal
 import subprocess
+from datetime import datetime
 from html.parser import HTMLParser
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -25,6 +26,12 @@ API_KEY = "lm-studio"
 client = OpenAI(
     base_url=BASE_URL,
     api_key=API_KEY,
+)
+
+
+RUN_AUDIT_LOG = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "dbai_run_audit.log",
 )
 
 
@@ -77,6 +84,33 @@ def print_section(title, body=None, color=COLOR_BLUE):
         print(body)
         print(line)
         print()
+
+
+def append_run_audit_log(command, status, exit_code=None, output=None):
+    # Keep a simple append-only audit log for /run activity.
+    timestamp = datetime.now().isoformat(timespec="seconds")
+
+    entry = [
+        "=" * 60,
+        f"Timestamp: {timestamp}",
+        f"Status: {status}",
+        f"Command: {command}",
+    ]
+
+    if exit_code is not None:
+        entry.append(f"Exit code: {exit_code}")
+
+    if output:
+        entry.append("Output:")
+        entry.append(output.rstrip("\n"))
+
+    entry.append("")
+
+    try:
+        with open(RUN_AUDIT_LOG, "a", encoding="utf-8") as f:
+            f.write("\n".join(entry) + "\n")
+    except Exception as e:
+        print_error(f"Could not write run audit log: {e}")
 
 
 # Commands used for tab autocomplete
@@ -887,6 +921,10 @@ def run_ai_command(answer):
         # This is intentionally stricter than accepting "y".
         if approval != "yes":
             print_warning("Command NOT executed.")
+            append_run_audit_log(
+                command,
+                status="rejected",
+            )
 
             # Save the rejection so the AI knows the command
             # was not executed.
@@ -922,6 +960,12 @@ def run_ai_command(answer):
 
             print()
             print_success(f"Command exited with code: {return_code}")
+            append_run_audit_log(
+                command,
+                status="executed",
+                exit_code=return_code,
+                output="".join(combined_output),
+            )
 
             # Save the result so the AI can see what happened.
             command_results.append(
@@ -945,6 +989,11 @@ def run_ai_command(answer):
             print_warning(
                 f"Command interrupted. Exit code: {return_code}"
             )
+            append_run_audit_log(
+                command,
+                status="interrupted",
+                exit_code=return_code,
+            )
 
             command_results.append(
                 f"Command was interrupted by the user:\n"
@@ -956,6 +1005,11 @@ def run_ai_command(answer):
             # Report command execution errors without crashing
             # the entire program.
             print_error(f"\nCould not execute command: {e}")
+            append_run_audit_log(
+                command,
+                status="error",
+                output=str(e),
+            )
 
             command_results.append(
                 f"Command could not be executed:\n"
