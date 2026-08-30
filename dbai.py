@@ -4,6 +4,7 @@ import os
 import sys
 import glob
 import json
+import platform
 import readline
 import re
 import signal
@@ -986,6 +987,9 @@ def main():
     # Show the selected model.
     print(f"\nUsing: {model}")
 
+    host_os = platform.system()
+    host_shell = os.environ.get("SHELL", "unknown")
+
     # Conversation history sent to the model.
     messages = [
         {
@@ -997,6 +1001,11 @@ def main():
                 "Answer normal questions normally. "
 
                 "When files are provided, use their contents as context. "
+
+                f"You are running on {host_os}. "
+                f"The user's shell is {host_shell}. "
+                "When suggesting commands, prefer syntax and flags that "
+                "fit that environment. "
 
                 "When the user uses /write, you are allowed to create "
                 "or modify files. "
